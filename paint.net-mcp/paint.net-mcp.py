@@ -527,8 +527,14 @@ class Paint_Net_MCP:
         panes = [c for c in strip.children()
                  if c.element_info.automation_id == "ToleranceSliderControl"]
         if len(panes) != 2:
-            raise PdnError(f"Expected 2 ToleranceSliderControl panes, "
-                           f"found {len(panes)}.")
+            # drawConfigStrip is rebuilt per tool, exactly like the brush-size
+            # box: text, zoom, pan and the selection tools have no hardness or
+            # spacing at all. Absence is a fact about the active tool.
+            active = TOOL_MAP.get(self.getActiveToolIndex(), "unknown")
+            raise PdnError(f"Found {len(panes)} ToleranceSliderControl panes, "
+                           f"expected 2. The active tool ({active}) has no "
+                           f"hardness/spacing controls; select a brush-like "
+                           f"tool first.")
         return sorted(panes, key=lambda c: c.rectangle().left)
 
     # The slider paints its filled portion in the accent colour. Nothing about
@@ -536,16 +542,20 @@ class Paint_Net_MCP:
     # children, no name, no legacy value -- so the fill is measured from the
     # pixels instead. Verified against known settings: 25 -> 24.9, 50 -> 50.3,
     # 75 -> 75.1, 100 -> 100.0.
-    SLIDER_FILL_RGB = (0, 120, 215)
-    SLIDER_FILL_TOLERANCE = 60
-    SLIDER_MIN_FILL_PCT = 4.6      # the bar keeps a rounded cap even at zero
+    # The bar keeps a rounded cap even at zero, so an empty slider still shows
+    # a sliver of fill.
+    SLIDER_MIN_FILL_PCT = 4.6
 
     def _sliderFillPercent(self, pane):
         """Filled fraction of a slider, as a percentage.
 
-        Measured as the rightmost column containing fill colour, scanning every
-        row: the percentage text is drawn ON TOP of the bar, so a simple run of
-        matching pixels stops early where the digits cross it.
+        The fill colour is SAMPLED, not assumed: it is the Windows accent
+        colour, which the user can change, and a hardcoded value would stop
+        matching and report every slider as empty.
+
+        Measured as the rightmost column closer to the fill sample than to the
+        empty sample, scanning every row -- the percentage text is drawn ON TOP
+        of the bar, so a run of matching pixels stops early at the digits.
         """
         rect = pane.rectangle()
         self._parkCursor()
@@ -553,14 +563,27 @@ class Paint_Net_MCP:
             bbox=(rect.left + 1, rect.top + 1, rect.right - 1, rect.bottom - 1),
             all_screens=True).convert("RGB")
         width, height = image.size
-        if width < 4:
+        if width < 8:
             raise PdnError(f"Slider is only {width}px wide; cannot measure it.")
+
+        row = height // 2
+        fill = image.getpixel((1, row))          # always filled: the cap
+        empty = image.getpixel((width - 2, row))  # always empty: 100% is the max
+
+        def distance(a, b):
+            return sum(abs(a[i] - b[i]) for i in range(3))
+
+        if distance(fill, empty) < 60:
+            raise PdnError(
+                f"Cannot tell the slider's filled and empty colours apart "
+                f"(both about {fill}); it may be at an extreme, or the theme "
+                f"may render it without contrast.")
+
         last = -1
         for x in range(width):
             for y in range(height):
                 pixel = image.getpixel((x, y))
-                if max(abs(pixel[i] - self.SLIDER_FILL_RGB[i])
-                       for i in range(3)) <= self.SLIDER_FILL_TOLERANCE:
+                if distance(pixel, fill) < distance(pixel, empty):
                     last = x
                     break
         return (last + 1) / width * 100.0
@@ -568,6 +591,11 @@ class Paint_Net_MCP:
     def _setSlider(self, pane, percent, name):
         if not 0 <= percent <= 100:
             raise PdnError(f"Percent must be 0-100, got {percent}.")
+        # Focus first. If Paint.NET is not the foreground window, the click
+        # that would set the slider is swallowed activating the window instead,
+        # and the slider silently keeps its previous value.
+        self.focus()
+        time.sleep(0.15)
         rect = pane.rectangle()
         x = int(rect.left + (rect.width() - 1) * percent / 100.0)
         y = int((rect.top + rect.bottom) / 2)
@@ -677,6 +705,9 @@ class Paint_Net_MCP:
         ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
     def _clickAt(self, x, y):
+        # Callers that click Paint.NET's own UI must focus() first; see
+        # _setSlider. This helper deliberately does not focus, because some
+        # callers click while relying on an already-established focus state.
         self._moveTo(x, y)
         time.sleep(SETTLE)
         self._mouseDown()
@@ -1111,6 +1142,7 @@ class Paint_Net_MCP:
     def addText(self, x, y, text):
         self.selectTool("text")
         self.focus()
+        before_img = self._grabCanvas()
         before = self._mutationToken()
         self._clickAt(*self.imageToScreen(int(x), int(y)))
         time.sleep(0.2)
@@ -1118,7 +1150,30 @@ class Paint_Net_MCP:
         # Commit the text layer; until this the text is still an editable overlay.
         self._main().type_keys("{ESC}")
         self._assertMutated(before, "addText")
-        return {"text": text, "at": [x, y], "dirty": self.isDirty()}
+
+        # Where the ink landed, not merely that ink appeared: a stray brush
+        # stroke elsewhere would satisfy the mutation check just as well.
+        placement = {"verified_location": None}
+        try:
+            import numpy
+            after_img = self._grabCanvas()
+            changed = numpy.asarray(after_img, dtype=numpy.int16)
+            before_arr = numpy.asarray(before_img, dtype=numpy.int16)
+            if changed.shape == before_arr.shape:
+                mask = numpy.abs(changed - before_arr).max(axis=2) > 16
+                if mask.any():
+                    ys, xs = numpy.where(mask)
+                    box = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+                    near = abs(box[0] - int(x)) <= 40 and abs(box[1] - int(y)) <= 40
+                    placement = {"changed_bbox": box, "verified_location": near}
+                    if not near:
+                        placement["reason"] = (
+                            f"ink appeared at {box[:2]}, but the text was asked "
+                            f"for at {[int(x), int(y)]}")
+        except Exception as exc:
+            placement = {"verified_location": None,
+                         "reason": f"could not localise the change: {exc}"}
+        return {"text": text, "at": [x, y], "dirty": self.isDirty(), **placement}
 
     def drawShape(self, start, stop, type="rectangle"):
         """Kept from the original surface. start/stop are [x, y] image points."""
@@ -1707,11 +1762,16 @@ class Paint_Net_MCP:
         after = self.layerCount().get("count")
         result = {"action": "flatten", "layers_before": before,
                   "layers_after": after, "dirty": self.isDirty(),
-                  "verified": after == 1 or after is None}
+                  "verified": after == 1}
         if after is None:
+            # Consistent with success is not the same as verified. With one
+            # layer the list needs no scrollbar, so the count goes unreadable
+            # exactly when the operation worked -- which is precisely when a
+            # "verified" flag would be least trustworthy.
             result["reason"] = ("layer count unreadable after flattening: "
-                                "with one layer the list needs no scrollbar. "
-                                "Consistent with success, not proof of it")
+                                "with one layer the list needs no scrollbar, "
+                                "which is consistent with success but does "
+                                "not demonstrate it")
         elif after != 1:
             result["reason"] = (f"expected a single layer after flattening, "
                                 f"the list extent reports {after}")
@@ -2177,7 +2237,17 @@ class Paint_Net_MCP:
         accept = dlg.child_window(auto_id=self.FILE_DIALOG_ACCEPT_ID,
                                   control_type="Button")
         if accept.exists(timeout=2):
-            accept.wrapper_object().click_input()
+            button = accept.wrapper_object()
+            # Wait for it to be enabled. The dialog disables it while it
+            # digests the typed path, and a click landing then does nothing
+            # at all -- silently leaving the dialog open.
+            deadline = time.time() + TIMEOUT
+            while time.time() < deadline and not button.is_enabled():
+                time.sleep(SETTLE)
+            if not button.is_enabled():
+                raise PdnError("The file dialog's accept button stayed "
+                               "disabled; the path may be rejected.")
+            button.click_input()
         else:
             box.type_keys("{ENTER}")
 
@@ -2236,8 +2306,16 @@ class Paint_Net_MCP:
                         f"Dialog {title!r} appeared after saving and has no "
                         f"recognised accept button. Buttons: "
                         f"{[b.window_text() for b in buttons]}. Call recover().")
-                chosen.click_input()
-                handled.append(f"{title}:{chosen.window_text().strip() or 'OK'}")
+                label = chosen.window_text().strip() or "OK"
+                try:
+                    chosen.click_input()
+                except Exception as exc:
+                    # Do not abandon the dialog: it is modal, and leaving it
+                    # open disables the canvas for everything afterwards.
+                    raise PdnError(
+                        f"Could not click {label!r} on {title!r}: {exc}. "
+                        f"The dialog is still open; call recover().") from exc
+                handled.append(f"{title}:{label}")
                 time.sleep(0.6)
         return handled
 
@@ -2270,7 +2348,14 @@ class Paint_Net_MCP:
         def written():
             return target.exists() and target.stat().st_mtime != before_mtime
 
-        followed = self._clearFollowUpDialogs(done=written)
+        try:
+            followed = self._clearFollowUpDialogs(done=written)
+        except PdnError:
+            # Surface the dialog state rather than leaving a
+            # modal open with no indication of why.
+            raise PdnError(
+                f"save failed with dialogs still open: "
+                f"{self.openDialogs()}. Call recover().")
         if not written():
             raise PdnError(f"{target} was not written. Dialogs handled: "
                            f"{followed}; still open: {self.openDialogs()}.")
@@ -2311,7 +2396,14 @@ class Paint_Net_MCP:
                 return False
             return [dims["width"], dims["height"]] == expected
 
-        self._clearFollowUpDialogs(done=opened)
+        try:
+            self._clearFollowUpDialogs(done=opened)
+        except PdnError:
+            # Surface the dialog state rather than leaving a
+            # modal open with no indication of why.
+            raise PdnError(
+                f"open failed with dialogs still open: "
+                f"{self.openDialogs()}. Call recover().")
 
         # A different document means different controls and a new mapping.
         self._invalidateElementCache()
